@@ -583,6 +583,65 @@ def test_align_continuation_resumes_from_latest_committed_state(
     assert num_computed_tokens == continuation_hit
 
 
+@pytest.mark.parametrize(
+    ("spec_cls", "chunks", "continuation_hit"),
+    [(MambaSpec, [32, 1], 0), (RwkvStateSpec, [16, 16, 1], 16)],
+)
+def test_align_keeps_state_before_replaceable_generation_prompt(
+    spec_cls, chunks, continuation_hit
+) -> None:
+    """The next chat turn drops the generation prompt ("<think"). When the
+    prompt-end boundary falls inside that tail, RWKV also stops prefill and
+    keeps the state before it, so the next turn still resumes there."""
+    from irwkv.v1.core.sched.scheduler import Scheduler
+
+    init_none_hash(sha256)
+    spec = spec_cls(
+        block_size=16, shapes=((1,),), dtypes=(torch.float32,), mamba_cache_mode="align"
+    )
+    manager = KVCacheManager(
+        KVCacheConfig(
+            num_blocks=16,
+            kv_cache_tensors=[],
+            kv_cache_groups=[KVCacheGroupSpec(["state"], spec)],
+            prefix_cache_retention_interval=0,
+        ),
+        max_model_len=128,
+        scheduler_block_size=16,
+        hash_block_size=16,
+    )
+    scheduler = SimpleNamespace(
+        block_size=16,
+        cache_config=SimpleNamespace(block_size=16),
+        max_num_scheduled_tokens=64,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+        hash_block_size=16,
+        mamba_partial_cache_hit=False,
+        mamba_shared_prefix_checkpoint=False,
+        mamba_has_prefill_checkpoint_blocks=False,
+        mamba_continuation_tail_tokens=(manager.coordinator.continuation_tail_tokens),
+    )
+    prompt = list(range(1, 34))
+    turn = _block_hashed_request("turn", prompt)
+    scheduled = []
+    while turn.num_computed_tokens < len(prompt):
+        chunk = Scheduler._mamba_block_aligned_split(
+            scheduler, turn, len(prompt) - turn.num_computed_tokens
+        )
+        assert manager.allocate_slots(turn, chunk) is not None
+        turn.num_computed_tokens += chunk
+        manager.new_step_starts()
+        scheduled.append(chunk)
+    manager.free(turn)
+
+    assert scheduled == chunks
+    continuation = _block_hashed_request(
+        "continuation", [*prompt[:-2], *range(200, 210)]
+    )
+    _, num_computed_tokens, _ = manager.get_computed_blocks(continuation)
+    assert num_computed_tokens == continuation_hit
+
+
 def _config() -> SimpleNamespace:
     model_config = SimpleNamespace(
         hf_config=SimpleNamespace(),

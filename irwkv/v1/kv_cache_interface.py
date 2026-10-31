@@ -989,6 +989,12 @@ class MambaSpec(KVCacheSpec):
         """Whether align mode keeps each request's latest committed state."""
         return False
 
+    @property
+    def continuation_tail_tokens(self) -> int:
+        """Prompt-tail tokens a follow-up request may replace, such as a chat
+        generation prompt. Align mode also keeps the state before that tail."""
+        return 0
+
     def max_memory_usage_bytes(self, irwkv_config: IrwkvConfig) -> int:
         if irwkv_config.cache_config.mamba_cache_mode == "align":
             return self.page_size_bytes * (2 + self.num_prefill_checkpoint_blocks)
