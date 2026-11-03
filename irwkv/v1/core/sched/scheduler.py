@@ -453,8 +453,8 @@ class Scheduler(SchedulerInterface):
         # State before a replaceable prompt tail (the chat generation prompt).
         continuation_stop = (
             (request.num_prompt_tokens - self.mamba_continuation_tail_tokens)
-            // block_size
-            * block_size
+            // ckpt_block_size
+            * ckpt_block_size
             if self.mamba_continuation_tail_tokens
             else 0
         )
