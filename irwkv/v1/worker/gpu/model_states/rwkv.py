@@ -15,6 +15,7 @@ from irwkv.model_executor.models.rwkv import _load_flashrwkv2
 from irwkv.sampling_params import SamplingParams
 from irwkv.v1.core.sched.output import NewRequestData
 from irwkv.v1.kv_cache_interface import KVCacheConfig
+from irwkv.v1.outputs import LogprobsTensors
 from irwkv.v1.worker.gpu.buffer_utils import UvaBackedTensor
 from irwkv.v1.worker.gpu.input_batch import InputBatch, get_num_sampled_and_rejected
 from irwkv.v1.worker.gpu.mm.encoder_cache import EncoderCache
@@ -22,9 +23,26 @@ from irwkv.v1.worker.gpu.model_states.default import DefaultModelState
 from irwkv.v1.worker.gpu.sample.bad_words import BadWordsState
 from irwkv.v1.worker.gpu.sample.logit_bias import LogitBiasState
 from irwkv.v1.worker.gpu.sample.logits_processor.interface import LogitsContext
+from irwkv.v1.worker.gpu.sample.logprob import compute_topk_scores
 from irwkv.v1.worker.gpu.sample.output import SamplerOutput
 from irwkv.v1.worker.gpu.sample.sampler import Sampler
 from irwkv.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
+
+
+def _scatter_logprobs(
+    active: LogprobsTensors, active_rows: torch.Tensor, num_reqs: int
+) -> LogprobsTensors:
+    """Place active-row logprobs at their batch rows; mid-prefill rows are unused."""
+
+    def scatter(values: torch.Tensor) -> torch.Tensor:
+        rows = values.new_zeros((num_reqs, *values.shape[1:]))
+        return rows.index_copy_(0, active_rows, values)
+
+    return LogprobsTensors(
+        logprob_token_ids=scatter(active.logprob_token_ids),
+        logprobs=scatter(active.logprobs),
+        selected_token_ranks=scatter(active.selected_token_ranks),
+    )
 
 
 class _RwkvSamplingGraph:
@@ -167,9 +185,13 @@ class RwkvSampler(Sampler):
         structured_outputs_worker: StructuredOutputsWorker | None = None,
     ) -> SamplerOutput | None:
         idx_mapping_np = input_batch.idx_mapping_np
+        logprobs_dims = self.get_logprobs_dims(idx_mapping_np)
         if (
             self.compute_nans
-            or self.get_logprobs_dims(idx_mapping_np) is not None
+            or (
+                logprobs_dims is not None
+                and self.logprobs_mode not in ("raw_logprobs", "raw_logits")
+            )
             or np.any(self.needs_logits_processing[idx_mapping_np])
             or not self._sampling_graphs
         ):
@@ -243,8 +265,25 @@ class RwkvSampler(Sampler):
         sampling_graph.num_active.fill_(num_active)
         sampling_graph.replay(apply_grammar_bitmask)
 
+        sampled_active = sampling_graph.sampled[:num_active].to(torch.int64)
         sampled = torch.zeros(num_reqs, dtype=torch.int64, device=hidden_states.device)
-        sampled[active_rows] = sampling_graph.sampled[:num_active].to(torch.int64)
+        sampled[active_rows] = sampled_active
+        logprobs_tensors = None
+        if logprobs_dims is not None:
+            num_logprobs, max_per_req_token_ids = logprobs_dims
+            logprobs_tensors = compute_topk_scores(
+                sampling_graph.logits[:num_active],
+                num_logprobs,
+                sampled_active,
+                logprob_token_ids_state=self.logprob_token_ids_state,
+                expanded_idx_mapping=active_slots_i64,
+                max_per_req_token_ids=max_per_req_token_ids,
+                logits_mode=self.logprobs_mode == "raw_logits",
+            )
+            if num_active != num_reqs:
+                logprobs_tensors = _scatter_logprobs(
+                    logprobs_tensors, active_rows, num_reqs
+                )
         num_sampled, num_rejected = get_num_sampled_and_rejected(
             input_batch.seq_lens.new_ones(num_reqs),
             input_batch.seq_lens,
@@ -254,7 +293,7 @@ class RwkvSampler(Sampler):
         )
         return SamplerOutput(
             sampled_token_ids=sampled.view(-1, 1),
-            logprobs_tensors=None,
+            logprobs_tensors=logprobs_tensors,
             num_nans=None,
             num_sampled=num_sampled,
             num_rejected=num_rejected,

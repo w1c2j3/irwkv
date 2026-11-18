@@ -45,6 +45,7 @@ from irwkv.v1.attention.backends.rwkv_attn import (
 from irwkv.v1.core.kv_cache_manager import KVCacheManager
 from irwkv.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from irwkv.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, MambaSpec
+from irwkv.v1.outputs import LogprobsTensors
 from irwkv.v1.request import Request
 from irwkv.v1.worker.gpu.model_states.rwkv import (
     RwkvModelState,
@@ -1406,6 +1407,54 @@ def test_rapid_sampler_graph_compacts_completed_prefills(monkeypatch) -> None:
     assert torch.equal(graph.top_k[:3], torch.tensor([18, 19, 16]))
 
 
+@pytest.mark.parametrize(
+    ("logprobs_mode", "graphed"),
+    [("raw_logprobs", True), ("raw_logits", True), ("processed_logprobs", False)],
+)
+def test_rapid_sampler_graph_returns_raw_logprobs(
+    monkeypatch, logprobs_mode: str, graphed: bool
+) -> None:
+    """Raw logprobs come from the graphed logits at the batch rows of the
+    sampled requests; processed modes keep the eager sampler path."""
+    calls: list[Any] = []
+    scored: list[Any] = []
+    sampler, graph = _graph_sampler(monkeypatch, calls)
+    sampler.logprobs_mode = logprobs_mode
+    sampler.get_logprobs_dims = lambda idx_mapping_np: (1, 0)
+    sampler.logprob_token_ids_state = None
+
+    def compute_topk_scores(logits, num_logprobs, sampled, **kwargs):
+        scored.append((logits, sampled, kwargs))
+        rows = sampled.shape[0]
+        return LogprobsTensors(
+            logprob_token_ids=sampled.view(-1, 1).repeat(1, 2),
+            logprobs=torch.arange(rows * 2, dtype=torch.float32).view(rows, 2) + 1,
+            selected_token_ranks=torch.arange(rows) + 1,
+        )
+
+    monkeypatch.setattr(
+        "irwkv.v1.worker.gpu.model_states.rwkv.compute_topk_scores",
+        compute_topk_scores,
+    )
+    output = sampler.sample_hidden_states(
+        torch.zeros(4, 3), _graph_input_batch([1, 2, 3, 0]), None
+    )
+
+    if not graphed:
+        assert output is None
+        return
+    assert output is not None and output.logprobs_tensors is not None
+    logits, sampled, kwargs = scored[0]
+    assert logits.data_ptr() == graph.logits.data_ptr() and logits.shape[0] == 3
+    assert torch.equal(sampled, torch.tensor([10, 11, 12]))
+    assert torch.equal(kwargs["expanded_idx_mapping"], torch.tensor([2, 3, 0]))
+    assert kwargs["logits_mode"] == (logprobs_mode == "raw_logits")
+    logprobs = output.logprobs_tensors
+    assert torch.equal(logprobs.logprob_token_ids[:, 0], torch.tensor([10, 0, 11, 12]))
+    assert torch.equal(logprobs.logprobs[:, 0], torch.tensor([1.0, 0.0, 3.0, 5.0]))
+    assert torch.equal(logprobs.selected_token_ranks, torch.tensor([1, 0, 2, 3]))
+
+
 def _grammar_worker(calls: list[Any]) -> Any:
     def apply_grammar_bitmask(logits, input_batch, req_ids, bitmask) -> None:
         cu_num_logits = input_batch.cu_num_logits.tolist()
@@ -1824,7 +1873,7 @@ def test_real_model_batching_preserves_tokens_and_logprobs(
             expected_hit = max_hit // hit_unit * hit_unit if prefix_caching else 0
             assert hit.num_cached_tokens == expected_hit
             single, mixed = cold.outputs[0], hit.outputs[0]
-            # Without logprobs the graph run uses the separate head/sampling graphs.
+            # Graph runs compute raw logprobs from the graphed head logits.
             sampled = runner.llm.generate([prompt], sampling_only)[0].outputs[0]
             assert sampled.token_ids == single.token_ids
         assert len(single.token_ids) == 4
